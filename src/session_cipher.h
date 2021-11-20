@@ -3,11 +3,20 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <unistd.h>
+#include <string.h>
 #include "signal_protocol_types.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+
+long heap_start;
+long heap_end;
+void set_head_start();
+void* key_in_memory(ratchet_message_keys* key, void* mem_contents, long mem_size);
+void keys_in_memory(ratchet_message_keys* keys, int key_count);
 
 /**
  * The main entry point for Signal Protocol encrypt/decrypt operations.
@@ -84,7 +93,7 @@ void session_cipher_set_decryption_callback(session_cipher *cipher,
  */
 int session_cipher_encrypt(session_cipher *cipher,
         const uint8_t *padded_message, size_t padded_message_len,
-        ciphertext_message **encrypted_message);
+        ciphertext_message **encrypted_message, ratchet_message_keys* seen_keys, int *key_count);
 
 /**
  * Decrypt a message.
@@ -106,7 +115,7 @@ int session_cipher_encrypt(session_cipher *cipher,
  */
 int session_cipher_decrypt_pre_key_signal_message(session_cipher *cipher,
         pre_key_signal_message *ciphertext, void *decrypt_context,
-        signal_buffer **plaintext);
+        signal_buffer **plaintext, ratchet_message_keys* seen_keys, int *key_count);
 
 /**
  * Decrypt a message.
@@ -125,7 +134,7 @@ int session_cipher_decrypt_pre_key_signal_message(session_cipher *cipher,
  */
 int session_cipher_decrypt_signal_message(session_cipher *cipher,
         signal_message *ciphertext, void *decrypt_context,
-        signal_buffer **plaintext);
+        signal_buffer **plaintext, ratchet_message_keys* seen_keys, int *key_count);
 
 /**
  * Gets the remote registration ID for this session cipher.

@@ -1,6 +1,9 @@
 #include "session_cipher.h"
 
 #include <assert.h>
+#include <time.h>
+#include <errno.h>
+#include <stdio.h>
 #include <string.h>
 #include "session_builder.h"
 #include "session_builder_internal.h"
@@ -10,6 +13,8 @@
 #include "protocol.h"
 #include "signal_protocol_internal.h"
 
+FILE* outfile;
+extern int errno ;
 struct session_cipher
 {
     signal_protocol_store_context *store;
@@ -22,9 +27,9 @@ struct session_cipher
 };
 
 static int session_cipher_decrypt_from_record_and_signal_message(session_cipher *cipher,
-        session_record *record, signal_message *ciphertext, signal_buffer **plaintext);
+        session_record *record, signal_message *ciphertext, signal_buffer **plaintext, ratchet_message_keys* seen_keys, int *key_count);
 static int session_cipher_decrypt_from_state_and_signal_message(session_cipher *cipher,
-        session_state *state, signal_message *ciphertext, signal_buffer **plaintext);
+        session_state *state, signal_message *ciphertext, signal_buffer **plaintext, ratchet_message_keys* seen_keys, int *key_count);
 
 static int session_cipher_get_or_create_chain_key(session_cipher *cipher,
         ratchet_chain_key **chain_key,
@@ -44,6 +49,56 @@ static int session_cipher_get_plaintext(session_cipher *cipher,
         const uint8_t *ciphertext, size_t ciphertext_len);
 
 static int session_cipher_decrypt_callback(session_cipher *cipher, signal_buffer *plaintext, void *decrypt_context);
+
+void set_head_start()
+{
+    heap_start = sbrk(0);
+    return;
+}
+
+void* key_in_memory(ratchet_message_keys* key, void* mem_contents, long mem_size)
+{
+    return memmem(mem_contents, mem_size, (void *)key, sizeof(ratchet_message_keys));
+}
+
+void keys_in_memory(ratchet_message_keys* keys, int key_count)
+{
+    printf("Starting\n");
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (f == NULL) {
+      int errnum = errno;
+      printf("Value of errno: %d\n", errno);
+      perror("Error printed by perror");
+      printf("Error opening file: %s\n", strerror( errnum ));
+      return;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    long fsize = 0;
+    fseek(f, 0, SEEK_SET);
+    char *mem_contents = malloc(fsize + 1);
+    fread(mem_contents, 1, fsize, f);
+    fclose(f);
+    mem_contents[fsize] = 0;
+
+    printf("Allocated memory\n");
+
+    int k; 
+    for (k = 0; k < key_count; k++)
+    {
+        printf("Checking key %d\n", k);
+        void* ptr = key_in_memory(&(keys[k]), mem_contents, fsize);
+        if (ptr)
+        {
+            printf("Found key from addr %l at addr %l.\n", (long int) &(keys[k]), (long int) ptr);
+        }
+    }
+    
+    free(mem_contents);
+    printf("Deallocated memory\n");
+    return;
+}
+
 
 int session_cipher_create(session_cipher **cipher,
         signal_protocol_store_context *store, const signal_protocol_address *remote_address,
@@ -97,7 +152,8 @@ void session_cipher_set_decryption_callback(session_cipher *cipher,
 
 int session_cipher_encrypt(session_cipher *cipher,
         const uint8_t *padded_message, size_t padded_message_len,
-        ciphertext_message **encrypted_message)
+        ciphertext_message **encrypted_message, ratchet_message_keys* seen_keys, 
+        int* key_count)
 {
     int result = 0;
     session_record *record = 0;
@@ -146,6 +202,16 @@ int session_cipher_encrypt(session_cipher *cipher,
     if(result < 0) {
         goto complete;
     }
+
+    // Save key to array
+    memcpy((void *)&seen_keys[(*key_count)++], (void *)&message_keys, sizeof(ratchet_message_keys));
+
+    // Log to file
+    time_t current_time;
+    time(&current_time);
+    if (!outfile) outfile = fopen("keys.log","w");
+    fwrite ((const void*)&message_keys, sizeof(ratchet_message_keys), 1, outfile);
+    fprintf(outfile, "\t%lld\tencrypt\n", current_time);
 
     sender_ephemeral = session_state_get_sender_ratchet_key(state);
     if(!sender_ephemeral) {
@@ -258,7 +324,7 @@ complete:
 
 int session_cipher_decrypt_pre_key_signal_message(session_cipher *cipher,
         pre_key_signal_message *ciphertext, void *decrypt_context,
-        signal_buffer **plaintext)
+        signal_buffer **plaintext, ratchet_message_keys* seen_keys, int *key_count)
 {
     int result = 0;
     signal_buffer *result_buf = 0;
@@ -287,7 +353,7 @@ int session_cipher_decrypt_pre_key_signal_message(session_cipher *cipher,
 
     result = session_cipher_decrypt_from_record_and_signal_message(cipher, record,
             pre_key_signal_message_get_signal_message(ciphertext),
-            &result_buf);
+            &result_buf, seen_keys, key_count);
     if(result < 0) {
         goto complete;
     }
@@ -323,8 +389,9 @@ complete:
 
 int session_cipher_decrypt_signal_message(session_cipher *cipher,
         signal_message *ciphertext, void *decrypt_context,
-        signal_buffer **plaintext)
+        signal_buffer **plaintext, ratchet_message_keys* seen_keys, int *key_count)
 {
+
     int result = 0;
     signal_buffer *result_buf = 0;
     session_record *record = 0;
@@ -354,7 +421,7 @@ int session_cipher_decrypt_signal_message(session_cipher *cipher,
     }
 
     result = session_cipher_decrypt_from_record_and_signal_message(
-            cipher, record, ciphertext, &result_buf);
+            cipher, record, ciphertext, &result_buf, seen_keys, key_count);
     if(result < 0) {
         goto complete;
     }
@@ -380,7 +447,8 @@ complete:
 }
 
 static int session_cipher_decrypt_from_record_and_signal_message(session_cipher *cipher,
-        session_record *record, signal_message *ciphertext, signal_buffer **plaintext)
+        session_record *record, signal_message *ciphertext, signal_buffer **plaintext,
+        ratchet_message_keys* seen_keys, int* key_count)
 {
     int result = 0;
     signal_buffer *result_buf = 0;
@@ -400,7 +468,7 @@ static int session_cipher_decrypt_from_record_and_signal_message(session_cipher 
 
         //TODO Collect and log invalid message errors if totally unsuccessful
 
-        result = session_cipher_decrypt_from_state_and_signal_message(cipher, state_copy, ciphertext, &result_buf);
+        result = session_cipher_decrypt_from_state_and_signal_message(cipher, state_copy, ciphertext, &result_buf, seen_keys, key_count);
         if(result < 0 && result != SG_ERR_INVALID_MESSAGE) {
             goto complete;
         }
@@ -421,7 +489,7 @@ static int session_cipher_decrypt_from_record_and_signal_message(session_cipher 
             goto complete;
         }
 
-        result = session_cipher_decrypt_from_state_and_signal_message(cipher, state_copy, ciphertext, &result_buf);
+        result = session_cipher_decrypt_from_state_and_signal_message(cipher, state_copy, ciphertext, &result_buf, seen_keys, key_count);
         if(result < 0 && result != SG_ERR_INVALID_MESSAGE) {
             goto complete;
         }
@@ -452,7 +520,8 @@ complete:
 }
 
 static int session_cipher_decrypt_from_state_and_signal_message(session_cipher *cipher,
-        session_state *state, signal_message *ciphertext, signal_buffer **plaintext)
+        session_state *state, signal_message *ciphertext, signal_buffer **plaintext,
+        ratchet_message_keys* seen_keys, int* key_count)
 {
     int result = 0;
     signal_buffer *result_buf = 0;
@@ -499,6 +568,16 @@ static int session_cipher_decrypt_from_state_and_signal_message(session_cipher *
     if(result < 0) {
         goto complete;
     }
+
+    // Save key to array
+    memcpy((void *)&seen_keys[(*key_count)++], (void *)&message_keys, sizeof(ratchet_message_keys));
+
+    // Log to file
+    time_t current_time;
+    time(&current_time);
+    if (!outfile) outfile = fopen("keys.log","w");
+    fwrite ((const void*)&message_keys, sizeof(ratchet_message_keys), 1, outfile);
+    fprintf(outfile, "\t%lld\tdecrypt\n", current_time);
 
     remote_identity_key = session_state_get_remote_identity_key(state);
     if(!remote_identity_key) {

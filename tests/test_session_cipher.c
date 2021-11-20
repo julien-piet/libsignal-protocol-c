@@ -12,9 +12,14 @@
 #include "protocol.h"
 #include "test_common.h"
 
+
+ratchet_message_keys seen_keys[20000];
+int key_count = 0;
+
 signal_context *global_context;
 pthread_mutex_t global_mutex;
 pthread_mutexattr_t global_mutex_attr;
+extern FILE* outfile;
 
 void test_lock(void *user_data)
 {
@@ -166,7 +171,7 @@ void initialize_sessions_v3(session_state *alice_state, session_state *bob_state
     SIGNAL_UNREF(bob_parameters);
 }
 
-void generate_test_message_collections(session_cipher *cipher, signal_buffer **plaintext_messages, signal_buffer **ciphertext_messages, int size)
+void generate_test_message_collections(session_cipher *cipher, signal_buffer **plaintext_messages, signal_buffer **ciphertext_messages, int size, ratchet_message_keys* seen_keys, int* key_count)
 {
     /*
      * This test message is kept here as a byte array constant, rather than
@@ -192,7 +197,8 @@ void generate_test_message_collections(session_cipher *cipher, signal_buffer **p
 
         /* Generate the ciphertext */
         ciphertext_message *encrypted_message = 0;
-        result = session_cipher_encrypt(cipher, plain_buf_data, plain_buf_len, &encrypted_message);
+        result = session_cipher_encrypt(cipher, plain_buf_data, plain_buf_len, &encrypted_message, seen_keys, key_count);
+        keys_in_memory(seen_keys, *key_count);
         ck_assert_int_eq(result, 0);
         signal_buffer *cipher_buf = ciphertext_message_get_serialized(encrypted_message);
 
@@ -212,7 +218,7 @@ void generate_test_message_collections(session_cipher *cipher, signal_buffer **p
     shuffle_buffers(ciphertext_messages, size);
 }
 
-void decrypt_and_compare_messages(session_cipher *cipher, signal_buffer *ciphertext, signal_buffer *plaintext)
+void decrypt_and_compare_messages(session_cipher *cipher, signal_buffer *ciphertext, signal_buffer *plaintext, ratchet_message_keys* seen_keys, int *key_count)
 {
     int result = 0;
 
@@ -226,7 +232,7 @@ void decrypt_and_compare_messages(session_cipher *cipher, signal_buffer *ciphert
 
     /* Decrypt the message */
     signal_buffer *index_plaintext = 0;
-    result = session_cipher_decrypt_signal_message(cipher, index_message_deserialized, 0, &index_plaintext);
+    result = session_cipher_decrypt_signal_message(cipher, index_message_deserialized, 0, &index_plaintext, seen_keys, key_count);
     ck_assert_int_eq(result, 0);
 
     /* Compare the messages */
@@ -275,7 +281,11 @@ void run_interaction(session_record *alice_session_record, session_record *bob_s
     static const char alice_plaintext[] = "This is a plaintext message.";
     size_t alice_plaintext_len = sizeof(alice_plaintext) - 1;
     ciphertext_message *alice_message = 0;
-    result = session_cipher_encrypt(alice_cipher, (uint8_t *)alice_plaintext, alice_plaintext_len, &alice_message);
+    
+    // Check that this doesn't copy all the data TODO
+    keys_in_memory(seen_keys, key_count);
+    result = session_cipher_encrypt(alice_cipher, (uint8_t *)alice_plaintext, alice_plaintext_len, &alice_message, seen_keys, &key_count);
+    keys_in_memory(seen_keys, key_count);
     ck_assert_int_eq(result, 0);
 
     /* Serialize the test message to create a fresh instance */
@@ -284,7 +294,8 @@ void run_interaction(session_record *alice_session_record, session_record *bob_s
 
     /* Have Bob decrypt the test message */
     signal_buffer *alice_plaintext_buffer = signal_buffer_create((uint8_t*) alice_plaintext, alice_plaintext_len);
-    decrypt_and_compare_messages(bob_cipher, alice_message_serialized, alice_plaintext_buffer);
+    decrypt_and_compare_messages(bob_cipher, alice_message_serialized, alice_plaintext_buffer, seen_keys, &key_count);
+    keys_in_memory(seen_keys, key_count);
 
     fprintf(stderr, "Interaction complete: Alice -> Bob\n");
 
@@ -292,7 +303,8 @@ void run_interaction(session_record *alice_session_record, session_record *bob_s
     static const char bob_reply[] = "This is a message from Bob.";
     size_t bob_reply_len = sizeof(bob_reply) - 1;
     ciphertext_message *reply_message = 0;
-    result = session_cipher_encrypt(bob_cipher, (uint8_t *)bob_reply, bob_reply_len, &reply_message);
+    result = session_cipher_encrypt(bob_cipher, (uint8_t *)bob_reply, bob_reply_len, &reply_message, seen_keys, &key_count);
+    keys_in_memory(seen_keys, key_count);
     ck_assert_int_eq(result, 0);
 
     /* Serialize the reply message to create a fresh instance */
@@ -301,7 +313,8 @@ void run_interaction(session_record *alice_session_record, session_record *bob_s
 
     /* Have Alice decrypt the reply message */
     signal_buffer *bob_plaintext_buffer = signal_buffer_create((uint8_t*) bob_reply, bob_reply_len);
-    decrypt_and_compare_messages(alice_cipher, reply_message_serialized, bob_plaintext_buffer);
+    decrypt_and_compare_messages(alice_cipher, reply_message_serialized, bob_plaintext_buffer, seen_keys, &key_count);
+    keys_in_memory(seen_keys, key_count);
 
     fprintf(stderr, "Interaction complete: Bob -> Alice\n");
 
@@ -310,11 +323,12 @@ void run_interaction(session_record *alice_session_record, session_record *bob_s
     /* Generate 50 indexed Alice test messages */
     signal_buffer *alice_plaintext_messages[50];
     signal_buffer *alice_ciphertext_messages[50];
-    generate_test_message_collections(alice_cipher, alice_plaintext_messages, alice_ciphertext_messages, 50);
+    generate_test_message_collections(alice_cipher, alice_plaintext_messages, alice_ciphertext_messages, 50, seen_keys, &key_count);
 
     /* Iterate through half the collection and try to decrypt messages */
     for(i = 0; i < 25; i++) {
-        decrypt_and_compare_messages(bob_cipher, alice_ciphertext_messages[i], alice_plaintext_messages[i]);
+        decrypt_and_compare_messages(bob_cipher, alice_ciphertext_messages[i], alice_plaintext_messages[i], seen_keys, &key_count);
+        keys_in_memory(seen_keys, key_count);
     }
 
     fprintf(stderr, "Interaction complete: Alice -> Bob (randomized, 0-24)\n");
@@ -322,25 +336,28 @@ void run_interaction(session_record *alice_session_record, session_record *bob_s
     /* Generate 50 indexed Bob test messages */
     signal_buffer *bob_plaintext_messages[50];
     signal_buffer *bob_ciphertext_messages[50];
-    generate_test_message_collections(bob_cipher, bob_plaintext_messages, bob_ciphertext_messages, 50);
+    generate_test_message_collections(bob_cipher, bob_plaintext_messages, bob_ciphertext_messages, 50, seen_keys, &key_count);
 
     /* Iterate through half the collection and try to decrypt messages */
     for(i = 0; i < 25; i++) {
-        decrypt_and_compare_messages(alice_cipher, bob_ciphertext_messages[i], bob_plaintext_messages[i]);
+        decrypt_and_compare_messages(alice_cipher, bob_ciphertext_messages[i], bob_plaintext_messages[i], seen_keys, &key_count);
+        keys_in_memory(seen_keys, key_count);
     }
 
     fprintf(stderr, "Interaction complete: Bob -> Alice (randomized, 0-24)\n");
 
     /* Iterate through the second half of the collection and try to decrypt messages */
     for(i = 25; i < 50; i++) {
-        decrypt_and_compare_messages(bob_cipher, alice_ciphertext_messages[i], alice_plaintext_messages[i]);
+        decrypt_and_compare_messages(bob_cipher, alice_ciphertext_messages[i], alice_plaintext_messages[i], seen_keys, &key_count);
+        keys_in_memory(seen_keys, key_count);
     }
 
     fprintf(stderr, "Interaction complete: Alice -> Bob (randomized, 25-49)\n");
 
     /* Iterate through the second half of the collection and try to decrypt messages */
     for(i = 25; i < 50; i++) {
-        decrypt_and_compare_messages(alice_cipher, bob_ciphertext_messages[i], bob_plaintext_messages[i]);
+        decrypt_and_compare_messages(alice_cipher, bob_ciphertext_messages[i], bob_plaintext_messages[i], seen_keys, &key_count);
+        keys_in_memory(seen_keys, key_count);
     }
 
     fprintf(stderr, "Interaction complete: Bob -> Alice (randomized, 25-49)\n");
@@ -426,7 +443,7 @@ START_TEST(test_message_key_limits)
         size_t alice_plaintext_len = sizeof(alice_plaintext) - 1;
 
         ciphertext_message *alice_message = 0;
-        result = session_cipher_encrypt(alice_cipher, (uint8_t *)alice_plaintext, alice_plaintext_len, &alice_message);
+        result = session_cipher_encrypt(alice_cipher, (uint8_t *)alice_plaintext, alice_plaintext_len, &alice_message, seen_keys, &key_count);
         ck_assert_int_eq(result, 0);
         ck_assert_int_eq(ciphertext_message_get_type(alice_message), CIPHERTEXT_SIGNAL_TYPE);
         inflight[i] = (signal_message *)alice_message;
@@ -438,7 +455,7 @@ START_TEST(test_message_key_limits)
     /* Try decrypting in-flight message 1000 */
     result = signal_message_copy(&message_copy, inflight[1000], global_context);
     ck_assert_int_eq(result, 0);
-    result = session_cipher_decrypt_signal_message(bob_cipher, message_copy, 0, &buffer);
+    result = session_cipher_decrypt_signal_message(bob_cipher, message_copy, 0, &buffer, seen_keys, &key_count);
     ck_assert_int_eq(result, 0);
     ck_assert_ptr_ne(buffer, 0);
     signal_buffer_free(buffer); buffer = 0;
@@ -447,7 +464,7 @@ START_TEST(test_message_key_limits)
     /* Try decrypting in-flight message 2009 */
     result = signal_message_copy(&message_copy, inflight[2009], global_context);
     ck_assert_int_eq(result, 0);
-    result = session_cipher_decrypt_signal_message(bob_cipher, message_copy, 0, &buffer);
+    result = session_cipher_decrypt_signal_message(bob_cipher, message_copy, 0, &buffer, seen_keys, &key_count);
     ck_assert_int_eq(result, 0);
     ck_assert_ptr_ne(buffer, 0);
     signal_buffer_free(buffer); buffer = 0;
@@ -456,7 +473,7 @@ START_TEST(test_message_key_limits)
     /* Try decrypting in-flight message 0, which should fail */
     result = signal_message_copy(&message_copy, inflight[0], global_context);
     ck_assert_int_eq(result, 0);
-    result = session_cipher_decrypt_signal_message(bob_cipher, message_copy, 0, &buffer);
+    result = session_cipher_decrypt_signal_message(bob_cipher, message_copy, 0, &buffer, seen_keys, &key_count);
     ck_assert_int_eq(result, SG_ERR_DUPLICATE_MESSAGE);
     signal_buffer_free(buffer); buffer = 0;
     SIGNAL_UNREF(message_copy);
@@ -483,7 +500,7 @@ Suite *session_cipher_suite(void)
     TCase *tcase = tcase_create("case");
     tcase_add_checked_fixture(tcase, test_setup, test_teardown);
     tcase_add_test(tcase, test_basic_session_v3);
-    tcase_add_test(tcase, test_message_key_limits);
+    //tcase_add_test(tcase, test_message_key_limits);
     suite_add_tcase(suite, tcase);
 
     return suite;
@@ -491,6 +508,9 @@ Suite *session_cipher_suite(void)
 
 int main(void)
 {
+    set_head_start();
+
+    if (!outfile) outfile = fopen("keys.log", "w");
     int number_failed;
     Suite *suite;
     SRunner *runner;
@@ -501,5 +521,7 @@ int main(void)
     srunner_run_all(runner, CK_VERBOSE);
     number_failed = srunner_ntests_failed(runner);
     srunner_free(runner);
+
+    fclose(outfile);
     return (number_failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
